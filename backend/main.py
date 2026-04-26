@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 from typing import Any
 
@@ -31,6 +32,55 @@ class CareSearchRequest(BaseModel):
 class GenieRequest(BaseModel):
     question: str
     conversation_id: str | None = None
+
+
+INDIAN_STATES = [
+    "andhra pradesh",
+    "arunachal pradesh",
+    "assam",
+    "bihar",
+    "chhattisgarh",
+    "goa",
+    "gujarat",
+    "haryana",
+    "himachal pradesh",
+    "jharkhand",
+    "karnataka",
+    "kerala",
+    "madhya pradesh",
+    "maharashtra",
+    "manipur",
+    "meghalaya",
+    "mizoram",
+    "nagaland",
+    "odisha",
+    "punjab",
+    "rajasthan",
+    "sikkim",
+    "tamil nadu",
+    "telangana",
+    "tripura",
+    "uttar pradesh",
+    "uttarakhand",
+    "west bengal",
+    "delhi",
+    "jammu and kashmir",
+    "ladakh",
+]
+
+
+QUERY_CAPABILITY_PATTERNS = {
+    "has_icu": (r"\bicu\b", r"critical care"),
+    "has_oxygen": (r"oxygen", r"\bo2\b"),
+    "has_ventilator": (r"ventilator",),
+    "has_emergency_surgery": (r"emergency surgery", r"appendectomy", r"surgery", r"operation"),
+    "has_anesthesiologist": (r"anesthe", r"anaesthe"),
+    "has_dialysis": (r"dialysis", r"renal"),
+    "has_oncology": (r"oncology", r"cancer", r"chemotherapy"),
+    "has_trauma_care": (r"trauma", r"accident"),
+    "has_neonatal_care": (r"neonatal", r"nicu", r"newborn"),
+    "availability_24_7": (r"24\s*/\s*7", r"24x7", r"round the clock", r"emergency"),
+}
 
 
 def env(name: str, default: str | None = None) -> str:
@@ -206,6 +256,67 @@ def triage_query(query: str) -> dict[str, Any]:
     }
 
 
+def parse_query_capabilities(query: str) -> list[str]:
+    lower = query.lower()
+    fields = [
+        field
+        for field, patterns in QUERY_CAPABILITY_PATTERNS.items()
+        if any(re.search(pattern, lower) for pattern in patterns)
+    ]
+    return list(dict.fromkeys(fields))
+
+
+def detect_location(query: str) -> dict[str, str | None]:
+    lower = query.lower()
+    pin_match = re.search(r"\b\d{6}\b", query)
+    location: dict[str, str | None] = {
+        "pin_code": pin_match.group(0) if pin_match else None,
+        "state": next((state.title() for state in INDIAN_STATES if re.search(rf"\b{re.escape(state)}\b", lower)), None),
+        "city": None,
+    }
+
+    try:
+        rows = execute_sql(
+            f"""
+            SELECT district_city, state, COUNT(*) AS n
+            FROM {table_name('facility_capabilities')}
+            WHERE district_city IS NOT NULL
+              AND LENGTH(TRIM(CAST(district_city AS STRING))) >= 3
+              AND INSTR(LOWER({sql_literal(query)}), LOWER(TRIM(CAST(district_city AS STRING)))) > 0
+            GROUP BY district_city, state
+            ORDER BY LENGTH(TRIM(CAST(district_city AS STRING))) DESC, n DESC
+            LIMIT 1
+            """,
+            wait_timeout="10s",
+        )
+        if rows:
+            location["city"] = rows[0].get("district_city")
+            if not location["state"]:
+                location["state"] = rows[0].get("state")
+    except Exception:
+        pass
+
+    return location
+
+
+def location_sql_filter(location: dict[str, str | None]) -> tuple[str, str]:
+    if location.get("pin_code"):
+        pin_code = str(location["pin_code"])
+        return f"pin_code = {sql_literal(pin_code)}", f"Applied PIN filter for {pin_code}."
+    if location.get("city"):
+        city = str(location["city"])
+        clause = f"LOWER(CAST(district_city AS STRING)) = LOWER({sql_literal(city)})"
+        if location.get("state"):
+            state = str(location["state"])
+            clause += f" AND LOWER(CAST(state AS STRING)) = LOWER({sql_literal(state)})"
+            return clause, f"Applied city/state filter for {city}, {state}."
+        return clause, f"Applied city filter for {city}."
+    if location.get("state"):
+        state = str(location["state"])
+        return f"LOWER(CAST(state AS STRING)) = LOWER({sql_literal(state)})", f"Applied state filter for {state}."
+    return "", "No explicit location filter was detected."
+
+
 def retrieve_vector_ids(query: str, top_k: int) -> list[str]:
     from databricks.vector_search.client import VectorSearchClient
 
@@ -235,11 +346,12 @@ def retrieve_vector_ids(query: str, top_k: int) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
-def rank_facility(row: dict[str, Any], preferred_capabilities: list[str]) -> float:
+def rank_facility(row: dict[str, Any], preferred_capabilities: list[str], query_capabilities: list[str] | None = None) -> float:
     trust = float(row.get("trust_score") or 0)
     triage_bonus = 4 * sum(bool(row.get(field)) for field in preferred_capabilities)
+    capability_bonus = 7 * sum(bool(row.get(field)) for field in (query_capabilities or []))
     contradiction_penalty = 8 * len(normalize_flags(row.get("contradiction_flags")))
-    return trust + triage_bonus - contradiction_penalty
+    return trust + triage_bonus + capability_bonus - contradiction_penalty
 
 
 def candidate_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -391,6 +503,9 @@ def care_search(request: CareSearchRequest) -> dict[str, Any]:
     top_k = max(1, min(request.top_k, 25))
     vector_top_k = request.vector_top_k or int(os.getenv("QUERY_VECTOR_TOP_K", "100"))
     triage = triage_query(request.query)
+    query_capabilities = list(dict.fromkeys(parse_query_capabilities(request.query) + triage["preferred_capabilities"]))
+    location = detect_location(request.query)
+    location_clause, location_note = location_sql_filter(location)
     retrieval_note = "Mosaic AI Vector Search was not used."
     candidate_ids: list[str] = []
 
@@ -407,17 +522,23 @@ def care_search(request: CareSearchRequest) -> dict[str, Any]:
         has_anesthesiologist, has_dialysis, has_oncology, has_trauma_care,
         has_neonatal_care, availability_24_7, doctor_availability
     """
-    if candidate_ids:
+    if location_clause:
+        statement = f"SELECT {columns} FROM {table_name('facility_capabilities')} WHERE {location_clause} ORDER BY trust_score DESC LIMIT 500"
+        retrieval_note = f"{retrieval_note} {location_note}"
+    elif candidate_ids:
         id_list = ", ".join(sql_literal(fid) for fid in candidate_ids)
         statement = f"SELECT {columns} FROM {table_name('facility_capabilities')} WHERE facility_id IN ({id_list})"
     else:
         statement = f"SELECT {columns} FROM {table_name('facility_capabilities')} ORDER BY trust_score DESC LIMIT 250"
 
     rows = execute_sql(statement)
+    if not rows and location_clause:
+        rows = execute_sql(f"SELECT {columns} FROM {table_name('facility_capabilities')} ORDER BY trust_score DESC LIMIT 250")
+        retrieval_note = f"{retrieval_note} Location filter returned no rows; fell back to national search."
     ranked_pool_size = max(top_k, int(os.getenv("LLM_RERANK_TOP_N", "12")) if env_bool("USE_LLM_FIT_SCORING", False) else top_k)
-    ranked = sorted(rows, key=lambda row: rank_facility(row, triage["preferred_capabilities"]), reverse=True)[:ranked_pool_size]
+    ranked = sorted(rows, key=lambda row: rank_facility(row, triage["preferred_capabilities"], query_capabilities), reverse=True)[:ranked_pool_size]
     for row in ranked:
-        row["rank_score"] = round(rank_facility(row, triage["preferred_capabilities"]), 2)
+        row["rank_score"] = round(rank_facility(row, triage["preferred_capabilities"], query_capabilities), 2)
         row["contradiction_flags"] = normalize_flags(row.get("contradiction_flags"))
         row["symptom_triage"] = triage
         row["extracted_evidence"] = json_safe(parse_jsonish(row.get("extracted_evidence"), row.get("extracted_evidence")))
@@ -428,6 +549,8 @@ def care_search(request: CareSearchRequest) -> dict[str, Any]:
     return {
         "query": request.query,
         "retrieval_note": retrieval_note,
+        "location_note": location_note,
+        "location": location,
         "llm_note": llm_note,
         "triage": triage,
         "ranked_facilities": ranked,
