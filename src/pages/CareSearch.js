@@ -175,6 +175,113 @@ function buildGenieChart(rows = []) {
   }));
 }
 
+function humanizeKey(key) {
+  return String(key || '')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, char => char.toUpperCase());
+}
+
+function firstPresent(row, keys) {
+  for (const key of keys) {
+    if (row?.[key] !== undefined && row?.[key] !== null && row?.[key] !== '') {
+      return row[key];
+    }
+  }
+  return null;
+}
+
+function firstFacilityLabel(row) {
+  const direct = firstPresent(row, ['name', 'facility_name', 'facility', 'recommended_facility', 'Recommended Facility']);
+  if (direct) return direct;
+  const firstString = Object.entries(row || {}).find(([, value]) => typeof value === 'string' && value.trim());
+  return firstString ? firstString[1] : 'Top facility';
+}
+
+function buildGenieAnswer(query, genieText, rows) {
+  if (!rows.length) {
+    return genieText || 'Genie returned a response without display text.';
+  }
+
+  const top = rows[0];
+  const trust = firstPresent(top, ['trust_score', 'Trust Score', 'avg_trust_score']);
+  const availability = firstPresent(top, ['availability_24_7', '24/7 Available', 'available_24_7']);
+  const flags = rows.filter(row => JSON.stringify(row).includes('too_many_unknown_capabilities')).length;
+  const title = `Healthcare Facilities for ${query}`;
+  const summary = [
+    `For "${query}", Genie returned ${rows.length} facility rows from the Databricks Genie Space.`,
+    `Recommended facility: ${firstFacilityLabel(top)}${trust !== null ? ` with trust score ${trust}` : ''}${availability !== null ? ` and 24/7 availability ${availability}` : ''}.`,
+    flags ? `Important note: ${flags} returned rows mention too many unknown capabilities, so critical services should be verified before routing.` : null,
+  ].filter(Boolean);
+
+  return `## ${title}\n\n${summary.join('\n\n')}`;
+}
+
+function formatInlineMarkdown(text) {
+  const parts = String(text).split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={index}>{part.slice(2, -2)}</strong>;
+    }
+    return <React.Fragment key={index}>{part}</React.Fragment>;
+  });
+}
+
+function MarkdownText({ text }) {
+  const lines = String(text || '').split('\n');
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {lines.map((line, index) => {
+        const trimmed = line.trim();
+        if (!trimmed) return <div key={index} style={{ height: 4 }} />;
+        if (trimmed.startsWith('## ')) {
+          return <h3 key={index} style={{ fontFamily: 'var(--font-display)', fontSize: 15, marginTop: 4 }}>{formatInlineMarkdown(trimmed.slice(3))}</h3>;
+        }
+        if (trimmed.startsWith('# ')) {
+          return <h2 key={index} style={{ fontFamily: 'var(--font-display)', fontSize: 17, marginTop: 4 }}>{formatInlineMarkdown(trimmed.slice(2))}</h2>;
+        }
+        if (trimmed.startsWith('- ') || trimmed.startsWith('• ')) {
+          return <div key={index} style={{ paddingLeft: 12 }}>• {formatInlineMarkdown(trimmed.slice(2))}</div>;
+        }
+        return <p key={index} style={{ margin: 0 }}>{formatInlineMarkdown(trimmed)}</p>;
+      })}
+    </div>
+  );
+}
+
+function GenieResultTable({ rows }) {
+  if (!rows?.length) return null;
+  const columns = Object.keys(rows[0]).slice(0, 6);
+  return (
+    <div style={{ marginTop: 12, border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden', background: 'white' }}>
+      <div style={{ padding: '8px 10px', fontWeight: 800, fontSize: 12, borderBottom: '1px solid var(--border)' }}>
+        Genie result table
+      </div>
+      <div style={{ overflowX: 'auto', maxHeight: 260 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11.5 }}>
+          <thead>
+            <tr style={{ background: 'var(--bg-primary)', textAlign: 'left' }}>
+              {columns.map(column => (
+                <th key={column} style={{ padding: 8, borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap' }}>{humanizeKey(column)}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.slice(0, 10).map((row, rowIndex) => (
+              <tr key={rowIndex}>
+                {columns.map(column => (
+                  <td key={column} style={{ padding: 8, borderBottom: '1px solid var(--border)', verticalAlign: 'top', maxWidth: 220 }}>
+                    {String(row[column] ?? '').slice(0, 180)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function EvidencePreview({ evidence }) {
   const entries = Object.entries(evidence || {}).slice(0, 4);
   if (!entries.length) {
@@ -283,7 +390,8 @@ function ChatBubble({ message }) {
         lineHeight: 1.6,
       }}
     >
-      {message.content}
+      {isUser ? message.content : <MarkdownText text={message.content} />}
+      <GenieResultTable rows={message.queryRows} />
       {message.sql?.length > 0 && (
         <details style={{ marginTop: 10 }}>
           <summary style={{ cursor: 'pointer', fontWeight: 700 }}>Generated SQL</summary>
@@ -352,32 +460,39 @@ export default function CareSearch() {
         searchCareMap(cleanQuery, 10),
       ]);
 
-      if (genieResponse.status === 'fulfilled') {
-        const response = genieResponse.value;
-        setConversationId(response.conversation_id);
-        const rows = extractGenieRows(response.query_results || []);
-        setGenieRows(rows);
-        setGenieNote(rows.length ? `Genie returned ${rows.length} structured rows for metrics and charts.` : 'Genie returned narrative guidance without tabular rows.');
-        const text = extractAttachmentText(response.attachments) || response.content || 'Genie returned a response without display text.';
-        const sql = (response.attachments || [])
-          .filter(attachment => attachment.query)
-          .map(attachment => attachment.query?.query || JSON.stringify(attachment.query, null, 2));
-        setMessages(previous => [...previous, { role: 'assistant', content: text, sql }]);
-      } else {
-        setGenieRows([]);
-        setGenieNote(`Genie unavailable: ${genieResponse.reason?.message || genieResponse.reason}`);
-        setMessages(previous => [
-          ...previous,
-          { role: 'assistant', content: `Genie could not answer this request yet. ${genieResponse.reason?.message || ''}` },
-        ]);
-      }
-
       if (searchResponse.status === 'fulfilled') {
         setAnswer(searchResponse.value);
       } else {
         setAnswer(null);
-        throw searchResponse.reason;
       }
+
+      let genieNarrative = '';
+      let sql = [];
+      let rows = [];
+      if (genieResponse.status === 'fulfilled') {
+        const response = genieResponse.value;
+        setConversationId(response.conversation_id);
+        rows = extractGenieRows(response.query_results || []);
+        setGenieRows(rows);
+        setGenieNote(rows.length ? `Genie returned ${rows.length} structured rows for metrics and charts.` : 'Genie returned narrative guidance without tabular rows.');
+        genieNarrative = response.content || extractAttachmentText(response.attachments) || '';
+        sql = (response.attachments || [])
+          .filter(attachment => attachment.query)
+          .map(attachment => attachment.query?.query || JSON.stringify(attachment.query, null, 2));
+      } else {
+        setGenieRows([]);
+        setGenieNote(`Genie unavailable: ${genieResponse.reason?.message || genieResponse.reason}`);
+      }
+
+      setMessages(previous => [
+        ...previous,
+        {
+          role: 'assistant',
+          content: buildGenieAnswer(cleanQuery, genieNarrative, rows),
+          sql,
+          queryRows: rows,
+        },
+      ]);
     } catch (err) {
       setError(err.message || String(err));
     } finally {
