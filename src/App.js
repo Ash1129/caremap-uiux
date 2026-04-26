@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import FacilitySearch from './pages/FacilitySearch';
-import HealthHeatmap from './pages/HealthHeatmap';
+import CareSearch from './pages/CareSearch';
+import GenieCopilot from './pages/GenieCopilot';
+import ServiceGaps from './pages/ServiceGaps';
 import './App.css';
 
 function ComingSoon({ title, emoji }) {
@@ -18,12 +19,9 @@ function ComingSoon({ title, emoji }) {
 }
 
 const navItems = [
-  { id: 'search', label: 'Facility Search', emoji: '🔍' },
-  { id: 'map', label: 'Health Heatmap', emoji: '🗺️' },
-  { id: 'ngo', label: 'NGO Dashboard', emoji: '📊' },
-  { id: 'chat', label: 'Patient Navigator', emoji: '🗣️' },
-  { id: 'supplier', label: 'Supplier Connect', emoji: '🔗' },
-  { id: 'collab', label: 'Care Clusters', emoji: '🤝' },
+  { id: 'search', label: 'Care Search', emoji: '🔍' },
+  { id: 'gaps', label: 'Service Gaps', emoji: '📊' },
+  { id: 'genie', label: 'Genie Copilot', emoji: '✨' },
 ];
 
 function LandingPage({ onEnter }) {
@@ -357,12 +355,9 @@ export default function App() {
   const [showLanding, setShowLanding] = useState(true);
 
   const pages = {
-    search: <FacilitySearch />,
-    map: <HealthHeatmap />,
-    ngo: <ComingSoon title="NGO Dashboard" emoji="📊" />,
-    chat: <ComingSoon title="Patient Navigator" emoji="🗣️" />,
-    supplier: <ComingSoon title="Supplier Connect" emoji="🔗" />,
-    collab: <ComingSoon title="Care Clusters" emoji="🤝" />,
+    search: <CareSearch />,
+    gaps: <ServiceGaps />,
+    genie: <GenieCopilot />,
   };
 
   if (showLanding) {
