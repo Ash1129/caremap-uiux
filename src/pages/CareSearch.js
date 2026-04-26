@@ -1,14 +1,179 @@
-import React, { useState } from 'react';
-import { AlertTriangle, Database, FileText, Loader2, MapPin, Search, ShieldCheck } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import {
+  AlertTriangle,
+  BarChart3,
+  Bot,
+  Database,
+  FileText,
+  Loader2,
+  MapPin,
+  Search,
+  Send,
+  ShieldCheck,
+  Sparkles,
+} from 'lucide-react';
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import TrustScore from '../components/TrustScore';
-import { searchCareMap } from '../api/caremapApi';
+import { askGenie, searchCareMap } from '../api/caremapApi';
 
 const exampleQueries = [
   'Chest pain in Bihar, need emergency care with oxygen and ICU support',
+  'Which states have the most high-risk medical desert regions?',
   'Trauma care facilities with high trust score',
   'Dialysis centers in underserved regions',
   'Newborn breathing difficulty near Assam',
 ];
+
+const serviceFields = [
+  ['has_icu', 'ICU'],
+  ['has_oxygen', 'Oxygen'],
+  ['has_ventilator', 'Ventilator'],
+  ['has_emergency_surgery', 'Surgery'],
+  ['has_dialysis', 'Dialysis'],
+  ['has_trauma_care', 'Trauma'],
+  ['has_neonatal_care', 'Neonatal'],
+  ['availability_24_7', '24/7'],
+];
+
+const chartColors = ['#2D9C9C', '#4F9F73', '#E6A23C', '#5B8DD9', '#D96C6C'];
+
+function numberFormat(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return value ?? '—';
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits: numeric % 1 ? 1 : 0 }).format(numeric);
+}
+
+function coerceBoolean(value) {
+  if (value === true || value === 1) return true;
+  if (typeof value === 'string') return ['true', '1', 'yes'].includes(value.toLowerCase());
+  return false;
+}
+
+function normalizeFlags(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [value];
+    } catch {
+      return value === '[]' ? [] : [value];
+    }
+  }
+  return [String(value)];
+}
+
+function extractAttachmentText(attachments = []) {
+  return attachments
+    .map(attachment => attachment.text?.content || attachment.text || attachment.content || '')
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function tableRowsFromStatementPayload(payload) {
+  const response = payload?.statement_response || payload?.result || payload;
+  const columns =
+    response?.manifest?.schema?.columns ||
+    response?.schema?.columns ||
+    payload?.manifest?.schema?.columns ||
+    [];
+  const columnNames = columns.map(column => column.name || column);
+  const data = response?.result?.data_array || response?.data_array || payload?.data_array || [];
+
+  if (!columnNames.length || !Array.isArray(data)) return [];
+  return data.map(row => Object.fromEntries(columnNames.map((name, index) => [name, row[index]])));
+}
+
+function extractGenieRows(queryResults = []) {
+  return queryResults.flatMap(item => tableRowsFromStatementPayload(item.result || item));
+}
+
+function buildGenieMetrics(rows, fallbackFacilities) {
+  const facilities = fallbackFacilities || [];
+  if (!rows.length) {
+    return [
+      ['Top facilities', facilities.length],
+      ['Avg trust', facilities.length ? facilities.reduce((sum, row) => sum + Number(row.trust_score || 0), 0) / facilities.length : null],
+      ['High trust', facilities.filter(row => Number(row.trust_score || 0) >= 80).length],
+      ['Flagged', facilities.filter(row => normalizeFlags(row.contradiction_flags).length > 0).length],
+    ];
+  }
+
+  const firstRow = rows[0] || {};
+  const numericEntries = Object.entries(firstRow)
+    .filter(([, value]) => value !== null && value !== '' && Number.isFinite(Number(value)))
+    .slice(0, 4);
+
+  if (numericEntries.length) {
+    return numericEntries.map(([key, value]) => [key.replaceAll('_', ' '), value]);
+  }
+
+  return [
+    ['Rows returned', rows.length],
+    ['Columns', Object.keys(firstRow).length],
+    ['Facilities shown', facilities.length],
+    ['Flagged', facilities.filter(row => normalizeFlags(row.contradiction_flags).length > 0).length],
+  ];
+}
+
+function buildTrustChart(facilities = []) {
+  const buckets = [
+    { label: '90-100', min: 90, max: 100, count: 0 },
+    { label: '80-89', min: 80, max: 89, count: 0 },
+    { label: '70-79', min: 70, max: 79, count: 0 },
+    { label: '<70', min: -Infinity, max: 69, count: 0 },
+  ];
+  facilities.forEach(facility => {
+    const score = Number(facility.trust_score || 0);
+    const bucket = buckets.find(item => score >= item.min && score <= item.max);
+    if (bucket) bucket.count += 1;
+  });
+  return buckets.map(({ label, count }) => ({ label, count }));
+}
+
+function buildCapabilityChart(facilities = []) {
+  return serviceFields.map(([key, label]) => ({
+    label,
+    count: facilities.filter(facility => coerceBoolean(facility[key])).length,
+  }));
+}
+
+function buildStateChart(facilities = []) {
+  const counts = facilities.reduce((acc, facility) => {
+    const state = facility.state || 'Unknown';
+    acc[state] = (acc[state] || 0) + 1;
+    return acc;
+  }, {});
+  return Object.entries(counts)
+    .map(([state, count]) => ({ state, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 6);
+}
+
+function buildGenieChart(rows = []) {
+  if (!rows.length) return [];
+  const firstRow = rows[0] || {};
+  const columns = Object.keys(firstRow);
+  const labelColumn = columns.find(key => !Number.isFinite(Number(firstRow[key]))) || columns[0];
+  const valueColumn = columns.find(key => key !== labelColumn && Number.isFinite(Number(firstRow[key])));
+  if (!labelColumn || !valueColumn) return [];
+
+  return rows.slice(0, 8).map(row => ({
+    label: String(row[labelColumn] || 'Unknown').slice(0, 24),
+    value: Number(row[valueColumn] || 0),
+  }));
+}
 
 function EvidencePreview({ evidence }) {
   const entries = Object.entries(evidence || {}).slice(0, 4);
@@ -32,7 +197,7 @@ function EvidencePreview({ evidence }) {
 
 function FacilityResult({ facility }) {
   const [expanded, setExpanded] = useState(false);
-  const flags = facility.contradiction_flags || [];
+  const flags = normalizeFlags(facility.contradiction_flags);
 
   return (
     <div className="card" style={{ padding: 16 }}>
@@ -48,17 +213,9 @@ function FacilityResult({ facility }) {
             {facility.district_city || 'Unknown district'}, {facility.state || 'Unknown state'} · {facility.pin_code || 'No PIN'}
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            {[
-              ['has_icu', 'ICU'],
-              ['has_oxygen', 'Oxygen'],
-              ['has_ventilator', 'Ventilator'],
-              ['has_emergency_surgery', 'Surgery'],
-              ['has_dialysis', 'Dialysis'],
-              ['has_trauma_care', 'Trauma'],
-              ['availability_24_7', '24/7'],
-            ].map(([key, label]) => (
-              <span key={key} className={facility[key] ? 'badge-verified' : 'badge-partial'}>
-                {facility[key] ? '✓' : '•'} {label}
+            {serviceFields.slice(0, 7).map(([key, label]) => (
+              <span key={key} className={coerceBoolean(facility[key]) ? 'badge-verified' : 'badge-partial'}>
+                {coerceBoolean(facility[key]) ? '✓' : '•'} {label}
               </span>
             ))}
           </div>
@@ -98,21 +255,120 @@ function FacilityResult({ facility }) {
   );
 }
 
+function ChatBubble({ message }) {
+  const isUser = message.role === 'user';
+  return (
+    <div
+      style={{
+        alignSelf: isUser ? 'flex-end' : 'flex-start',
+        maxWidth: '86%',
+        background: isUser ? 'var(--brand-teal)' : 'var(--bg-secondary)',
+        color: isUser ? 'white' : 'var(--text-primary)',
+        border: isUser ? 'none' : '1px solid var(--border)',
+        borderRadius: 12,
+        padding: 12,
+        whiteSpace: 'pre-wrap',
+        fontSize: 13,
+        lineHeight: 1.6,
+      }}
+    >
+      {message.content}
+      {message.sql?.length > 0 && (
+        <details style={{ marginTop: 10 }}>
+          <summary style={{ cursor: 'pointer', fontWeight: 700 }}>Generated SQL</summary>
+          {message.sql.map((query, index) => (
+            <pre key={index} style={{ marginTop: 8, overflowX: 'auto', fontSize: 11 }}>
+              {query}
+            </pre>
+          ))}
+        </details>
+      )}
+    </div>
+  );
+}
+
+function MetricCard({ label, value, sublabel }) {
+  return (
+    <div className="card" style={{ padding: 16, minHeight: 96 }}>
+      <div style={{ fontSize: 12, color: 'var(--text-muted)', textTransform: 'capitalize' }}>{label}</div>
+      <div style={{ fontFamily: 'var(--font-display)', fontSize: 27, fontWeight: 800, marginTop: 5 }}>{numberFormat(value)}</div>
+      {sublabel && <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>{sublabel}</div>}
+    </div>
+  );
+}
+
+function ChartCard({ title, icon, children }) {
+  return (
+    <div className="card" style={{ padding: 16, minHeight: 270 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+        {icon}
+        <strong style={{ fontFamily: 'var(--font-display)' }}>{title}</strong>
+      </div>
+      <div style={{ height: 210 }}>{children}</div>
+    </div>
+  );
+}
+
 export default function CareSearch() {
   const [query, setQuery] = useState(exampleQueries[0]);
+  const [conversationId, setConversationId] = useState(null);
+  const [messages, setMessages] = useState([]);
   const [answer, setAnswer] = useState(null);
+  const [genieRows, setGenieRows] = useState([]);
+  const [genieNote, setGenieNote] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const runSearch = async (nextQuery = query) => {
-    setQuery(nextQuery);
+  const facilities = answer?.ranked_facilities || [];
+  const metrics = useMemo(() => buildGenieMetrics(genieRows, facilities), [genieRows, facilities]);
+  const trustChart = useMemo(() => buildTrustChart(facilities), [facilities]);
+  const capabilityChart = useMemo(() => buildCapabilityChart(facilities), [facilities]);
+  const stateChart = useMemo(() => buildStateChart(facilities), [facilities]);
+  const genieChart = useMemo(() => buildGenieChart(genieRows), [genieRows]);
+
+  const submit = async (nextQuery = query) => {
+    const cleanQuery = nextQuery.trim();
+    if (!cleanQuery) return;
+
+    setQuery(cleanQuery);
     setLoading(true);
     setError('');
+    setMessages(previous => [...previous, { role: 'user', content: cleanQuery }]);
+
     try {
-      const result = await searchCareMap(nextQuery, 10);
-      setAnswer(result);
+      const [genieResponse, searchResponse] = await Promise.allSettled([
+        askGenie(cleanQuery, conversationId),
+        searchCareMap(cleanQuery, 10),
+      ]);
+
+      if (genieResponse.status === 'fulfilled') {
+        const response = genieResponse.value;
+        setConversationId(response.conversation_id);
+        const rows = extractGenieRows(response.query_results || []);
+        setGenieRows(rows);
+        setGenieNote(rows.length ? `Genie returned ${rows.length} structured rows for metrics and charts.` : 'Genie returned narrative guidance without tabular rows.');
+        const text = extractAttachmentText(response.attachments) || response.content || 'Genie returned a response without display text.';
+        const sql = (response.attachments || [])
+          .filter(attachment => attachment.query)
+          .map(attachment => attachment.query?.query || JSON.stringify(attachment.query, null, 2));
+        setMessages(previous => [...previous, { role: 'assistant', content: text, sql }]);
+      } else {
+        setGenieRows([]);
+        setGenieNote(`Genie unavailable: ${genieResponse.reason?.message || genieResponse.reason}`);
+        setMessages(previous => [
+          ...previous,
+          { role: 'assistant', content: `Genie could not answer this request yet. ${genieResponse.reason?.message || ''}` },
+        ]);
+      }
+
+      if (searchResponse.status === 'fulfilled') {
+        setAnswer(searchResponse.value);
+      } else {
+        setAnswer(null);
+        throw searchResponse.reason;
+      }
     } catch (err) {
-      setError(err.message);
+      setError(err.message || String(err));
     } finally {
       setLoading(false);
     }
@@ -120,94 +376,207 @@ export default function CareSearch() {
 
   return (
     <div style={{ minHeight: 'calc(100vh - 112px)', padding: 24 }}>
-      <div style={{ maxWidth: 1180, margin: '0 auto', display: 'grid', gridTemplateColumns: '1fr 300px', gap: 18 }}>
-        <main>
-          <div className="card" style={{ padding: 20, marginBottom: 14 }}>
-            <div className="section-label" style={{ marginBottom: 8 }}>Care Search</div>
-            <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 28, lineHeight: 1.15, marginBottom: 10 }}>
-              Search Databricks intelligence with symptom-aware routing
-            </h1>
-            <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 18 }}>
-              Uses Mosaic AI Vector Search for semantic retrieval, then reranks facilities by trust score, contradictions, and capability fit.
-            </p>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <div style={{ flex: 1, position: 'relative' }}>
-                <Search size={16} style={{ position: 'absolute', left: 14, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-                <input
-                  value={query}
-                  onChange={event => setQuery(event.target.value)}
-                  onKeyDown={event => event.key === 'Enter' && runSearch()}
-                  placeholder="Chest pain in Bihar, need emergency care with oxygen..."
-                  style={{
-                    width: '100%',
-                    border: '1.5px solid var(--border)',
-                    borderRadius: 10,
-                    padding: '12px 14px 12px 42px',
-                    fontSize: 14,
-                    outline: 'none',
-                  }}
-                />
-              </div>
-              <button className="btn-primary" onClick={() => runSearch()} disabled={loading}>
-                {loading ? <Loader2 size={16} /> : <Search size={16} />}
-                Search
-              </button>
-            </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 14 }}>
-              {exampleQueries.map(item => (
-                <button key={item} className="btn-secondary" onClick={() => runSearch(item)} style={{ padding: '6px 10px', fontSize: 12 }}>
-                  {item}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {error && (
-            <div className="card" style={{ padding: 14, borderColor: 'var(--critical-border)', color: 'var(--critical)', marginBottom: 14 }}>
-              {error}
-            </div>
-          )}
-
-          {answer && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <div className="card" style={{ padding: 14, display: 'flex', alignItems: 'center', gap: 10 }}>
-                <Database size={17} color="var(--brand-teal)" />
+      <div style={{ maxWidth: 1280, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <section className="card" style={{ overflow: 'hidden' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1.3fr 0.9fr', minHeight: 420 }}>
+            <div style={{ padding: 22, background: 'linear-gradient(135deg, #102A43 0%, #153854 62%, #1C5B67 100%)', color: 'white', display: 'flex', flexDirection: 'column' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 18 }}>
+                <div style={{ width: 42, height: 42, borderRadius: 12, background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.16)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Bot size={23} />
+                </div>
                 <div>
-                  <div style={{ fontSize: 13, fontWeight: 700 }}>{answer.retrieval_note}</div>
-                  <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                    Triage: {answer.triage?.categories?.join(', ') || 'No symptom category'} · urgency {answer.triage?.urgency}
+                  <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: 1.4, textTransform: 'uppercase', color: 'rgba(255,255,255,0.58)' }}>Genie Care Search</div>
+                  <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 30, lineHeight: 1.12 }}>Ask Genie. Route patients. Update readiness intelligence.</h1>
+                </div>
+              </div>
+
+              <div style={{ flex: 1, minHeight: 190, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, paddingRight: 4 }}>
+                {messages.length === 0 && (
+                  <div style={{ color: 'rgba(255,255,255,0.72)', fontSize: 13, lineHeight: 1.7, maxWidth: 720 }}>
+                    Ask a natural-language question. Genie analyzes governed Databricks tables while CareMap also runs symptom-aware Vector Search and trust reranking.
+                  </div>
+                )}
+                {messages.map((message, index) => (
+                  <ChatBubble key={`${message.role}-${index}`} message={message} />
+                ))}
+              </div>
+
+              <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+                <div style={{ flex: 1, position: 'relative' }}>
+                  <Search size={16} style={{ position: 'absolute', left: 14, top: '50%', transform: 'translateY(-50%)', color: 'rgba(255,255,255,0.5)' }} />
+                  <input
+                    value={query}
+                    onChange={event => setQuery(event.target.value)}
+                    onKeyDown={event => event.key === 'Enter' && submit()}
+                    placeholder="Ask Genie about symptoms, facilities, deserts, trust scores..."
+                    style={{
+                      width: '100%',
+                      border: '1px solid rgba(255,255,255,0.18)',
+                      background: 'rgba(255,255,255,0.08)',
+                      color: 'white',
+                      borderRadius: 10,
+                      padding: '13px 14px 13px 42px',
+                      fontSize: 14,
+                      outline: 'none',
+                    }}
+                  />
+                </div>
+                <button className="btn-primary" onClick={() => submit()} disabled={loading}>
+                  {loading ? <Loader2 size={16} /> : <Send size={16} />}
+                  Ask
+                </button>
+              </div>
+            </div>
+
+            <div style={{ padding: 20, background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                <div>
+                  <div className="section-label">Live Metrics</div>
+                  <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 20, marginTop: 3 }}>Filled from Genie and reranking</h2>
+                </div>
+                <Sparkles color="var(--brand-teal)" size={22} />
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                {metrics.map(([label, value], index) => (
+                  <MetricCard key={`${label}-${index}`} label={label} value={value} sublabel={index < 2 ? 'Genie/table derived' : 'Current query context'} />
+                ))}
+              </div>
+
+              <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div className="card" style={{ padding: 12, display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+                  <Database size={17} color="var(--brand-teal)" />
+                  <div>
+                    <div style={{ fontSize: 12.5, fontWeight: 800 }}>{answer?.retrieval_note || 'Vector Search will run with each Genie question.'}</div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+                      {genieNote || 'Genie output will update the metrics and charts after your first question.'}
+                    </div>
                   </div>
                 </div>
+                {answer?.triage?.safety_note && (
+                  <div className="card" style={{ padding: 12, display: 'flex', gap: 10, alignItems: 'flex-start', background: 'var(--partial-bg)' }}>
+                    <ShieldCheck size={17} color="var(--partial)" />
+                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                      {answer.triage.safety_note}
+                    </div>
+                  </div>
+                )}
               </div>
+            </div>
+          </div>
+        </section>
 
-              {(answer.ranked_facilities || []).map(facility => (
-                <FacilityResult key={facility.facility_id || facility.name} facility={facility} />
-              ))}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {exampleQueries.map(item => (
+            <button key={item} className="btn-secondary" onClick={() => submit(item)} style={{ padding: '7px 11px', fontSize: 12 }}>
+              {item}
+            </button>
+          ))}
+        </div>
 
-              {answer.ranked_facilities?.length === 0 && (
-                <div className="card" style={{ padding: 18, color: 'var(--text-secondary)' }}>
-                  No facilities matched the current query. Try removing a state or capability constraint.
+        {error && (
+          <div className="card" style={{ padding: 14, borderColor: 'var(--critical-border)', color: 'var(--critical)' }}>
+            {error}
+          </div>
+        )}
+
+        <section style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <ChartCard title="Genie query result chart" icon={<BarChart3 color="var(--brand-teal)" size={18} />}>
+            {genieChart.length ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={genieChart} margin={{ top: 4, right: 4, left: -18, bottom: 6 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#DDE6ED" />
+                  <XAxis dataKey="label" tick={{ fontSize: 10 }} interval={0} angle={-12} textAnchor="end" height={55} />
+                  <YAxis tick={{ fontSize: 11 }} />
+                  <Tooltip />
+                  <Bar dataKey="value" fill="#2D9C9C" radius={[5, 5, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 12 }}>
+                Ask Genie for a grouped metric, such as high-risk regions by state.
+              </div>
+            )}
+          </ChartCard>
+
+          <ChartCard title="Capability coverage in ranked facilities" icon={<ShieldCheck color="var(--brand-teal)" size={18} />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={capabilityChart} margin={{ top: 4, right: 4, left: -18, bottom: 6 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#DDE6ED" />
+                <XAxis dataKey="label" tick={{ fontSize: 10 }} interval={0} angle={-12} textAnchor="end" height={55} />
+                <YAxis allowDecimals={false} tick={{ fontSize: 11 }} />
+                <Tooltip />
+                <Bar dataKey="count" fill="#4F9F73" radius={[5, 5, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+
+          <ChartCard title="Trust score distribution" icon={<BarChart3 color="var(--brand-teal)" size={18} />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={trustChart} dataKey="count" nameKey="label" innerRadius={52} outerRadius={82} paddingAngle={3}>
+                  {trustChart.map((entry, index) => (
+                    <Cell key={entry.label} fill={chartColors[index % chartColors.length]} />
+                  ))}
+                </Pie>
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+          </ChartCard>
+
+          <ChartCard title="Ranked facilities by state" icon={<MapPin color="var(--brand-teal)" size={18} />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={stateChart} layout="vertical" margin={{ top: 4, right: 12, left: 24, bottom: 4 }}>
+                <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#DDE6ED" />
+                <XAxis type="number" allowDecimals={false} tick={{ fontSize: 11 }} />
+                <YAxis dataKey="state" type="category" tick={{ fontSize: 11 }} width={90} />
+                <Tooltip />
+                <Bar dataKey="count" fill="#5B8DD9" radius={[0, 5, 5, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </ChartCard>
+        </section>
+
+        <section style={{ display: 'grid', gridTemplateColumns: '1.3fr 0.7fr', gap: 16, alignItems: 'start' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end' }}>
+              <div>
+                <div className="section-label">Recommended Facilities</div>
+                <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 22 }}>Trust-ranked care options</h2>
+              </div>
+              <span className="badge-verified">{facilities.length} shown</span>
+            </div>
+
+            {facilities.map(facility => (
+              <FacilityResult key={facility.facility_id || facility.name} facility={facility} />
+            ))}
+
+            {answer && facilities.length === 0 && (
+              <div className="card" style={{ padding: 18, color: 'var(--text-secondary)' }}>
+                No facilities matched the current query. Try removing a state or capability constraint.
+              </div>
+            )}
+          </div>
+
+          <aside className="card" style={{ padding: 16, position: 'sticky', top: 144 }}>
+            <div className="section-label">Reasoning Chain</div>
+            <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {[
+                'Genie answers analytical questions over governed Databricks tables.',
+                'Vector Search retrieves semantic facility candidates for the same prompt.',
+                'CareMap reranks by trust score, symptom capability fit, and contradiction penalties.',
+                'Metrics and charts refresh from Genie query rows plus the ranked facility set.',
+              ].map((item, index) => (
+                <div key={item} style={{ display: 'grid', gridTemplateColumns: '24px 1fr', gap: 8, fontSize: 12.5, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                  <div style={{ width: 24, height: 24, borderRadius: 999, background: 'var(--brand-teal-light)', color: 'var(--brand-teal)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800 }}>
+                    {index + 1}
+                  </div>
+                  <div>{item}</div>
                 </div>
-              )}
+              ))}
             </div>
-          )}
-        </main>
-
-        <aside style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <div className="card" style={{ padding: 16 }}>
-            <ShieldCheck size={22} color="var(--brand-teal)" />
-            <h3 style={{ fontFamily: 'var(--font-display)', fontSize: 15, marginTop: 10 }}>Backend Path</h3>
-            <div style={{ fontSize: 12.5, color: 'var(--text-secondary)', lineHeight: 1.8, marginTop: 8 }}>
-              React → FastAPI → Databricks SQL + Mosaic AI Vector Search → trust-aware reranking.
-            </div>
-          </div>
-          <div className="card" style={{ padding: 16 }}>
-            <div className="section-label">Safe Use</div>
-            <p style={{ fontSize: 12.5, color: 'var(--text-secondary)', lineHeight: 1.7, marginTop: 8 }}>
-              Symptom triage routes to facility capabilities. It does not diagnose or replace emergency care.
-            </p>
-          </div>
-        </aside>
+          </aside>
+        </section>
       </div>
     </div>
   );
