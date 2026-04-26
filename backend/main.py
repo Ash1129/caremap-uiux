@@ -1,4 +1,5 @@
 import os
+import json
 import time
 from typing import Any
 
@@ -110,6 +111,41 @@ def normalize_flags(value: Any) -> list[str]:
     return [str(value)]
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def json_safe(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def parse_jsonish(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return default
+    return default
+
+
 def triage_query(query: str) -> dict[str, Any]:
     lower = query.lower()
     rules = [
@@ -206,6 +242,145 @@ def rank_facility(row: dict[str, Any], preferred_capabilities: list[str]) -> flo
     return trust + triage_bonus - contradiction_penalty
 
 
+def candidate_payload(row: dict[str, Any]) -> dict[str, Any]:
+    evidence = parse_jsonish(row.get("extracted_evidence"), {})
+    evidence_summary: dict[str, list[str]] = {}
+    if isinstance(evidence, dict):
+        for key, snippets in evidence.items():
+            if isinstance(snippets, list):
+                evidence_summary[key] = [str(item)[:220] for item in snippets[:2]]
+            else:
+                evidence_summary[key] = [str(snippets)[:220]]
+
+    return {
+        "facility_id": str(row.get("facility_id")),
+        "name": row.get("name"),
+        "state": row.get("state"),
+        "district_city": row.get("district_city"),
+        "pin_code": row.get("pin_code"),
+        "trust_score": row.get("trust_score"),
+        "deterministic_rank_score": row.get("rank_score"),
+        "contradiction_flags": normalize_flags(row.get("contradiction_flags")),
+        "capabilities": {
+            "ICU": row.get("has_icu"),
+            "oxygen": row.get("has_oxygen"),
+            "ventilator": row.get("has_ventilator"),
+            "emergency_surgery": row.get("has_emergency_surgery"),
+            "anesthesiologist": row.get("has_anesthesiologist"),
+            "dialysis": row.get("has_dialysis"),
+            "oncology": row.get("has_oncology"),
+            "trauma_care": row.get("has_trauma_care"),
+            "neonatal_care": row.get("has_neonatal_care"),
+            "availability_24_7": row.get("availability_24_7"),
+        },
+        "evidence": evidence_summary,
+        "trust_explanation": row.get("explanation"),
+    }
+
+
+def parse_llm_response(text: str) -> list[dict[str, Any]]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        cleaned = cleaned.removeprefix("json").strip()
+    data = json.loads(cleaned)
+    if isinstance(data, dict):
+        data = data.get("scores", data.get("results", []))
+    return data if isinstance(data, list) else []
+
+
+def llm_score_candidates(query: str, rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], str]:
+    if not env_bool("USE_LLM_FIT_SCORING", False):
+        return {}, "LLM query-fit scoring disabled."
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {}, "LLM query-fit scoring requested but OPENAI_API_KEY is missing."
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return {}, "LLM query-fit scoring requested but the openai package is not installed."
+
+    model = os.getenv("OPENAI_MODEL", "gpt-5.5")
+    max_candidates = max(1, min(int(os.getenv("LLM_RERANK_TOP_N", "12")), len(rows)))
+    payload = [candidate_payload(row) for row in rows[:max_candidates]]
+
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a cautious healthcare facility routing evaluator for India. "
+                    "Score how well each facility fits the user's query using only the provided "
+                    "structured capabilities, trust score, contradiction flags, location, and evidence snippets. "
+                    "Do not diagnose. Do not invent capabilities. Penalize contradictions, unknowns, weak evidence, "
+                    "and geographic mismatch. Return strict JSON only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "query": query,
+                        "scale": "0 means unsuitable; 100 means very strong evidence-backed fit",
+                        "required_output_schema": [
+                            {
+                                "facility_id": "string",
+                                "llm_fit_score": "number 0-100",
+                                "llm_score_reason": "one short evidence-grounded sentence",
+                            }
+                        ],
+                        "candidates": payload,
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+        ],
+    )
+    parsed = parse_llm_response(response.choices[0].message.content or "[]")
+    scores: dict[str, dict[str, Any]] = {}
+    for item in parsed:
+        facility_id = str(item.get("facility_id", ""))
+        if not facility_id:
+            continue
+        try:
+            fit_score = max(0.0, min(100.0, float(item.get("llm_fit_score", 0))))
+        except (TypeError, ValueError):
+            continue
+        scores[facility_id] = {
+            "llm_fit_score": round(fit_score, 2),
+            "llm_score_reason": str(item.get("llm_score_reason", ""))[:600],
+        }
+    return scores, f"LLM query-fit scorer reranked {len(scores)} candidates with {model}."
+
+
+def apply_llm_rerank(query: str, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    try:
+        llm_scores, note = llm_score_candidates(query, rows)
+    except Exception as exc:
+        return rows, f"LLM query-fit scorer failed ({type(exc).__name__}: {exc}); deterministic ranking used."
+    if not llm_scores:
+        return rows, note
+
+    reranked = []
+    for row in rows:
+        facility_id = str(row.get("facility_id"))
+        llm_score = llm_scores.get(facility_id)
+        if llm_score:
+            row = dict(row)
+            row.update(llm_score)
+            row["deterministic_rank_score"] = row.get("rank_score")
+            row["rank_score"] = round(0.65 * float(row.get("rank_score") or 0) + 0.35 * float(llm_score["llm_fit_score"]), 2)
+            row["explanation"] = (
+                f"{row.get('explanation') or ''} "
+                f"LLM query-fit score {llm_score['llm_fit_score']}/100: {llm_score['llm_score_reason']}"
+            ).strip()
+        reranked.append(row)
+    return sorted(reranked, key=lambda item: float(item.get("rank_score") or 0), reverse=True), note
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -239,15 +414,21 @@ def care_search(request: CareSearchRequest) -> dict[str, Any]:
         statement = f"SELECT {columns} FROM {table_name('facility_capabilities')} ORDER BY trust_score DESC LIMIT 250"
 
     rows = execute_sql(statement)
-    ranked = sorted(rows, key=lambda row: rank_facility(row, triage["preferred_capabilities"]), reverse=True)[:top_k]
+    ranked_pool_size = max(top_k, int(os.getenv("LLM_RERANK_TOP_N", "12")) if env_bool("USE_LLM_FIT_SCORING", False) else top_k)
+    ranked = sorted(rows, key=lambda row: rank_facility(row, triage["preferred_capabilities"]), reverse=True)[:ranked_pool_size]
     for row in ranked:
         row["rank_score"] = round(rank_facility(row, triage["preferred_capabilities"]), 2)
         row["contradiction_flags"] = normalize_flags(row.get("contradiction_flags"))
         row["symptom_triage"] = triage
+        row["extracted_evidence"] = json_safe(parse_jsonish(row.get("extracted_evidence"), row.get("extracted_evidence")))
+
+    ranked, llm_note = apply_llm_rerank(request.query, ranked)
+    ranked = ranked[:top_k]
 
     return {
         "query": request.query,
         "retrieval_note": retrieval_note,
+        "llm_note": llm_note,
         "triage": triage,
         "ranked_facilities": ranked,
     }

@@ -212,6 +212,12 @@ function FacilityResult({ facility }) {
             <MapPin size={14} />
             {facility.district_city || 'Unknown district'}, {facility.state || 'Unknown state'} · {facility.pin_code || 'No PIN'}
           </div>
+          {facility.llm_fit_score != null && (
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 10, padding: '4px 9px', borderRadius: 999, background: 'var(--brand-teal-light)', color: 'var(--brand-teal)', fontSize: 11, fontWeight: 800 }}>
+              <Sparkles size={12} />
+              LLM fit {Number(facility.llm_fit_score).toFixed(0)}/100
+            </div>
+          )}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             {serviceFields.slice(0, 7).map(([key, label]) => (
               <span key={key} className={coerceBoolean(facility[key]) ? 'badge-verified' : 'badge-partial'}>
@@ -244,6 +250,11 @@ function FacilityResult({ facility }) {
           <div>
             <div className="section-label" style={{ marginBottom: 8 }}>Scoring Explanation</div>
             <p style={{ fontSize: 12.5, color: 'var(--text-secondary)', lineHeight: 1.6 }}>{facility.explanation || 'No explanation returned.'}</p>
+            {facility.llm_score_reason && (
+              <p style={{ fontSize: 12.5, color: 'var(--brand-teal)', lineHeight: 1.6, marginTop: 8 }}>
+                <strong>LLM fit:</strong> {facility.llm_score_reason}
+              </p>
+            )}
           </div>
           <div>
             <div className="section-label" style={{ marginBottom: 8 }}>Evidence Snippets</div>
@@ -451,6 +462,11 @@ export default function CareSearch() {
                     <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
                       {genieNote || 'Genie output will update the metrics and charts after your first question.'}
                     </div>
+                    {answer?.llm_note && (
+                      <div style={{ fontSize: 12, color: 'var(--brand-teal)', marginTop: 4, fontWeight: 700 }}>
+                        {answer.llm_note}
+                      </div>
+                    )}
                   </div>
                 </div>
                 {answer?.triage?.safety_note && (
